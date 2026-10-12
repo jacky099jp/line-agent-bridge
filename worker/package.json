@@ -1,0 +1,12 @@
+{
+  "name": "line-agent-bridge-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LINE ↔ AI Agent 桥接 · 云端中继（Cloudflare Worker + D1）",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail --format pretty",
+    "db:init": "wrangler d1 execute line-agent-bridge --remote --file=./schema.sql"
+  }
+}

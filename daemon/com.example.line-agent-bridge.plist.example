@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  开机自启模板（macOS / launchd）
+  不要改这个文件 —— 用 ./install_daemon.sh 生成真正要用的那份。
+  它会自动把下面的 __PYTHON__ / __SCRIPT__ / __CONFIG__ 换成你机器上的真实路径。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.line-agent-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__SCRIPT__</string>
+    <string>--config</string>
+    <string>__CONFIG__</string>
+  </array>
+
+  <!-- 登录即启动；进程挂了自动拉起 -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- 网络未就绪时别放弃，等一会儿再重试 -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
+</dict>
+</plist>

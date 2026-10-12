@@ -1,0 +1,23 @@
+# 本地配置与密钥（绝不能提交）
+config.json
+*.secrets.json
+.env
+
+# 日志
+*.log
+logs/
+
+# Cloudflare / Node
+node_modules/
+.wrangler/
+package-lock.json
+
+# 备份
+*.bak
+*.bak-*
+
+# 系统
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

@@ -1,0 +1,18 @@
+{
+  "worker_url": "https://line-agent-bridge.你的子域.workers.dev",
+  "bridge_key": "和 wrangler secret put BRIDGE_KEY 填的同一串",
+
+  "poll_interval": 3,
+  "ping_interval": 30,
+  "log_file": "~/.line-agent-bridge/daemon.log",
+  "reply_prefix": "",
+
+  "handler": {
+    "type": "cmd",
+    "cmd": ["claude", "-p", "{text}"],
+    "timeout": 300,
+    "cwd": "",
+    "env": {},
+    "asr_cmd": []
+  }
+}

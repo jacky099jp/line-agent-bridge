@@ -1,0 +1,38 @@
+# Cloudflare Worker 配置
+# 部署前：把 database_id 换成你自己的（`wrangler d1 create line-agent-bridge` 会打印）
+
+name = "line-agent-bridge"
+main = "index.js"
+compatibility_date = "2026-01-01"
+workers_dev = true
+
+# ── D1 数据库（必须）──────────────────────────────────────
+# 创建：wrangler d1 create line-agent-bridge
+# 建表：wrangler d1 execute line-agent-bridge --remote --file=./schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "line-agent-bridge"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# ── Workers AI（可选，用于「本机不在线时云端兜底回答」）─────
+# 不需要云端兜底就把下面三行注释掉，然后把 AI_FALLBACK 设为 "off"
+[ai]
+binding = "AI"
+
+# ── 普通变量 ──────────────────────────────────────────────
+[vars]
+# 你的 LINE userId。留空则「第一条发消息的人」自动成为主人，之后不再接受其他人。
+OWNER_ID = ""
+# 额外允许的 userId，逗号分隔（例如家人想一起用）
+ALLOW_USERS = ""
+# 本机不在线时是否用云端 AI 兜底回答："on" / "off"
+AI_FALLBACK = "on"
+# 云端兜底的系统提示词，留空用内置默认
+SYSTEM_PROMPT = ""
+
+# ── 密钥（不要写在这里！用命令设置）────────────────────────
+#   wrangler secret put LINE_CHANNEL_SECRET
+#   wrangler secret put LINE_CHANNEL_TOKEN
+#   wrangler secret put BRIDGE_KEY
+#
+# 密钥存进 Cloudflare 后，wrangler deploy 不会覆盖它们，也不会出现在代码里。
