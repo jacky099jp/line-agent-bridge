@@ -1,410 +1,364 @@
 /**
- * LINE ↔ AI Agent 桥接 · 云端中继（Cloudflare Worker + D1）
- * ============================================================
+ * 小姚 · LINE 通道（Cloudflare Worker）
  *
- * 它做什么：
- *   1. 收 LINE 官方 webhook（验签）→ 写进 D1 队列
- *   2. 本机守护进程（daemon）定时 /poll 取信 → 交给你的 AI Agent → /reply 推回 LINE
- *   3. 本机不在线时，用 Cloudflare Workers AI 兜底直接答（可选，不配就是离线排队）
+ * 角色：LINE 与你本机「小姚」之间的中转站。
  *
- * 为什么要有这一层（直连不是更简单？）：
- *   - LINE 要求 webhook 必须公网可达 → 你家电脑没有公网 IP
- *   - 直连需要把 Channel token 放本机 → 中继层让 token 只留在云端，不下发
- *   - 本机断网/关机时消息不会丢 → 队列兜底
+ *   你 → LINE → 本 Worker（验签、入队、立即回 200）
+ *                    ↓
+ *              本机小姚每隔几秒来 /poll 取信
+ *                    ↓ 处理完
+ *              /reply → LINE push 给你
  *
- * 存储：D1（不要用 KV —— 免费版 KV 每天只有 1000 次「写+列表」，
- *      几秒一次的轮询当天就会耗尽，整站 500。这是踩过的坑。）
+ * 本机不在线时：消息照样入队，并立刻回你一句「已排队」的提示，
+ * 等小姚接上再正式回答。（不做任何 AI 代答，避免冒充小姚乱讲）
  *
- * ── 绑定（wrangler.toml）─────────────────────────────────
- *   DB                     D1 数据库（必须）
- *   AI                     Workers AI（可选，用于云端兜底）
- *   OWNER_ID               （可选）你的 LINE userId；留空则第一条消息自动认领
- *   ALLOW_USERS            （可选）额外允许的 userId，逗号分隔
- *   AI_FALLBACK            "on"/"off"，默认 on（需绑 AI）
- *   SYSTEM_PROMPT          （可选）云端兜底时的系统提示词
+ * 部署名保持 line-openclaw-worker（URL 不变，LINE 后台无需改动）。
  *
- * ── 密钥（wrangler secret put）───────────────────────────
- *   LINE_CHANNEL_SECRET    LINE channel secret（验签）
- *   LINE_CHANNEL_TOKEN     LINE channel access token（回推）
- *   BRIDGE_KEY             本机与云端之间的共享密钥（自己随便定一串）
+ * 【2026-10-12 存储改造】队列从 Workers KV 改为 D1。
+ *   起因：KV 免费版每天只有 1000 次「写 + 列表」额度，而本机每分钟
+ *   轮询一次（list + put）＝ 1440 次/天，结构上必然在当天某点耗尽，
+ *   之后 /poll、/status 全部抛 "KV list()/put() limit exceeded for the day."
+ *   → Worker 返回 500，整条 LINE 通道静默死掉（本机只看到 HTTP 500）。
+ *   D1 免费额度为 5,000,000 行读 / 100,000 行写 每天，够用两个数量级。
+ *
+ * 【2026-10-13 群组支持】Jack 要把小姚加进 LINE 群组当「记录事情」的通道。
+ *   原来只认 src.userId，群消息会被当成私聊：回复落到他私聊、会话也混在一起。
+ *   现在入队时一并记录来源类型与目标 id：
+ *     - srcType: 'user' | 'group' | 'room'
+ *     - srcId:   群组/多人房 id；私聊时等于 userId
+ *   回推时本机会带 target（群 → 群 id），Worker 推给 target；
+ *   群推失败（额度用尽 / 被移出群）会回退推给 Jack 私聊，绝不静默丢弃。
+ *   另外 /status 会回报最近一次收到的群 id，方便本机自动发现新群。
  */
 
-const TAKE_STALE_MS = 180 * 1000;        // 被取走但没确认，超过 3 分钟 → 重投或交云端
-const MSG_MAX_AGE_MS = 6 * 3600 * 1000;  // 队列里超过 6 小时的直接丢弃
-const MAX_QUEUE = 200;                   // 队列上限，防洪水
-const ONLINE_WINDOW_MS = 90 * 1000;      // 本机多久没取信算离线
-const REPLY_CHUNK = 4500;                // LINE 单条上限 5000，留余量
-const HISTORY_KEEP = 20;                 // 每个用户保留的历史条数
+const LINE_API = 'https://api.line.me/v2/bot';
 
-const DEFAULT_SYSTEM =
-  '你是一个通过 LINE 与用户对话的助手。回答简洁、口语化，不要用 Markdown 标记（LINE 不支持）。' +
-  '不确定的事直说不确定，不要编造。';
+const ONLINE_WINDOW_MS = 90 * 1000;   // 本机 90 秒内来取过信 → 视为在线
+const TAKE_STALE_MS = 180 * 1000;     // 被取走但没确认超过 3 分钟 → 退回队列
+const MSG_MAX_AGE_MS = 6 * 3600 * 1000; // 队列里超过 6 小时的直接丢弃
+const MAX_QUEUE = 50;                 // 队列上限，防洪水
 
-// Workers AI 模型会下线，别写死单个 —— 按顺序试。
-const AI_MODELS = [
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/meta/llama-3.1-8b-instruct',
-  '@cf/meta/llama-3-8b-instruct',
-];
+const QUEUED_NOTICE =
+  '【雲端】小姚的本機現在沒接上（電腦忙或離線），你這條已經排進隊伍了，' +
+  '他一接上就會回你。';
 
 // ---------------------------------------------------------------- 工具
 
-const json = (obj, status = 200) =>
-  new Response(JSON.stringify(obj), {
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
-
-function timingSafeEqual(a, b) {
-  a = String(a || '');
-  b = String(b || '');
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
 }
 
-/** LINE webhook 验签：x-line-signature = base64(HMAC-SHA256(channelSecret, body)) */
-async function verifySignature(body, signature, secret) {
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
+}
+
+/** LINE 的 x-line-signature = base64(HMAC-SHA256(channelSecret, rawBody)) */
+async function verifySignature(rawBody, signature, channelSecret) {
   if (!signature) return false;
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
-    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    'raw', enc.encode(channelSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(body));
-  let bin = '';
-  const bytes = new Uint8Array(mac);
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return timingSafeEqual(btoa(bin), signature);
+  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(rawBody));
+  const expected = btoa(String.fromCharCode(...new Uint8Array(mac)));
+  return timingSafeEqual(expected, signature);
 }
 
-/** 长文本切成 LINE 能吃下的若干段 */
-function chunkText(text, limit = REPLY_CHUNK) {
-  text = String(text || '');
-  if (text.length <= limit) return [text];
-  const out = [];
-  let cur = '';
-  for (const line of text.split('\n')) {
-    let seg = line;
-    while (seg.length > limit) {
-      if (cur) { out.push(cur); cur = ''; }
-      out.push(seg.slice(0, limit));
-      seg = seg.slice(limit);
-    }
-    if (cur.length + seg.length + 1 > limit) { out.push(cur); cur = seg; }
-    else cur = cur ? cur + '\n' + seg : seg;
-  }
-  if (cur) out.push(cur);
-  return out;
+async function pushToLine(userId, text, channelToken) {
+  const res = await fetch(LINE_API + '/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + channelToken,
+    },
+    body: JSON.stringify({ to: userId, messages: [{ type: 'text', text }] }),
+  });
+  return res.status;
 }
 
-// ---------------------------------------------------------------- 存储（D1）
-
-async function setMeta(env, k, v) {
-  await env.DB.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').bind(k, String(v)).run();
+/**
+ * 用 reply token 回覆 —— 免费、不占每月额度，但 token 有效期短（约 1 分钟）、
+ * 且只能用一次。失败返回非 2xx，由调用方回退到 push。
+ */
+async function replyToLine(replyToken, text, channelToken) {
+  const res = await fetch(LINE_API + '/message/reply', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + channelToken,
+    },
+    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
+  });
+  return res.status;
 }
+
+// ---------------------------------------------------------------- 队列（D1）
 
 async function getMeta(env, k) {
-  const row = await env.DB.prepare('SELECT v FROM meta WHERE k = ?').bind(k).first();
+  const row = await env.DB.prepare('SELECT v FROM line_meta WHERE k = ?').bind(k).first();
   return row ? row.v : null;
 }
 
-/** 本机是否在线：最近 ONLINE_WINDOW_MS 内取过信 */
+async function setMeta(env, k, v) {
+  await env.DB
+    .prepare('INSERT INTO line_meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+    .bind(k, v)
+    .run();
+}
+
 async function localOnline(env) {
-  const last = parseInt(await getMeta(env, 'poll:last'), 10);
-  return Number.isFinite(last) && Date.now() - last < ONLINE_WINDOW_MS;
-}
-
-/** 已认领的 owner（meta 优先，环境变量兜底） */
-async function ownerId(env) {
-  return (await getMeta(env, 'owner:id')) || env.OWNER_ID || '';
-}
-
-/** 是否允许这个用户（owner 未认领时，第一条消息自动认领） */
-async function isAllowed(env, userId) {
-  const owner = await ownerId(env);
-  if (!owner) {
-    await setMeta(env, 'owner:id', userId);
-    return { allowed: true, claimed: true };
-  }
-  if (userId === owner) return { allowed: true };
-  const extra = String(env.ALLOW_USERS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return { allowed: extra.includes(userId) };
+  const t = parseInt(await getMeta(env, 'poll:last'), 10);
+  return Number.isFinite(t) && Date.now() - t < ONLINE_WINDOW_MS;
 }
 
 async function enqueue(env, item) {
   const now = Date.now();
+  const ts = item.ts || now;
   await env.DB.batch([
-    // 顺手清理过期
-    env.DB.prepare('DELETE FROM inbox WHERE ts < ?').bind(now - MSG_MAX_AGE_MS),
+    // 顺手清理超龄消息
+    env.DB.prepare('DELETE FROM line_inbox WHERE ts < ?').bind(now - MSG_MAX_AGE_MS),
     env.DB.prepare(
-      'INSERT OR REPLACE INTO inbox (id, user_id, text, kind, message_id, ts, state, taken_at) ' +
-      "VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)"
-    ).bind(item.id, item.userId, item.text || '', item.kind || 'text', item.messageId || '', item.ts),
+      'INSERT OR REPLACE INTO line_inbox ' +
+      '(id, userId, text, kind, messageId, ts, state, takenAt, srcType, srcId, replyToken) ' +
+      "VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)"
+    ).bind(
+      item.id, item.userId, item.text || '', item.kind || 'text', item.messageId || '', ts,
+      item.srcType || 'user', item.srcId || item.userId || '', item.replyToken || ''
+    ),
   ]);
-  const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM inbox').first();
+  // 队列上限：满了丢最旧的
+  const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM line_inbox').first();
   const n = c ? Number(c.n) : 0;
   if (n > MAX_QUEUE) {
     await env.DB
-      .prepare('DELETE FROM inbox WHERE id IN (SELECT id FROM inbox ORDER BY ts ASC LIMIT ?)')
+      .prepare('DELETE FROM line_inbox WHERE id IN (SELECT id FROM line_inbox ORDER BY ts ASC LIMIT ?)')
       .bind(n - MAX_QUEUE)
       .run();
   }
 }
 
-/** 取信：pending 的，以及「被取走太久没确认」的都交出去 */
+/** 取信：pending 的和「取走太久没确认」的都交出去，并标记为 taken */
 async function poll(env) {
   const now = Date.now();
   const rs = await env.DB.prepare(
-    'SELECT id, user_id, text, kind, message_id, ts FROM inbox ' +
-    "WHERE ts > ? AND (state = 'pending' OR (state = 'taken' AND taken_at < ?)) " +
+    'SELECT id, userId, text, kind, messageId, ts, srcType, srcId, replyToken FROM line_inbox ' +
+    "WHERE ts > ? AND (state = 'pending' OR (state = 'taken' AND takenAt < ?)) " +
     'ORDER BY ts ASC LIMIT 100'
   ).bind(now - MSG_MAX_AGE_MS, now - TAKE_STALE_MS).all();
   const rows = (rs && rs.results) || [];
   if (!rows.length) return [];
-  const stmt = env.DB.prepare("UPDATE inbox SET state = 'taken', taken_at = ? WHERE id = ?");
+  const stmt = env.DB.prepare("UPDATE line_inbox SET state = 'taken', takenAt = ? WHERE id = ?");
   await env.DB.batch(rows.map((r) => stmt.bind(now, r.id)));
   return rows.map((v) => ({
     id: v.id,
-    userId: v.user_id,
+    userId: v.userId,
     text: v.text || '',
     kind: v.kind || 'text',
-    messageId: v.message_id || '',
+    messageId: v.messageId || '',
     ts: v.ts,
+    srcType: v.srcType || 'user',
+    srcId: v.srcId || '',
+    replyToken: v.replyToken || '',
   }));
 }
 
 async function ack(env, ids) {
   const list = (ids || []).filter(Boolean);
   if (!list.length) return;
-  const stmt = env.DB.prepare('DELETE FROM inbox WHERE id = ?');
+  const stmt = env.DB.prepare('DELETE FROM line_inbox WHERE id = ?');
   await env.DB.batch(list.map((id) => stmt.bind(id)));
-}
-
-async function dropFromQueue(env, id) {
-  if (id) await env.DB.prepare('DELETE FROM inbox WHERE id = ?').bind(id).run();
-}
-
-// 历史（给云端 AI 兜底做上下文）
-async function pushHistory(env, userId, role, text) {
-  await env.DB.prepare('INSERT INTO history (user_id, role, text, ts) VALUES (?, ?, ?, ?)')
-    .bind(userId, role, String(text || '').slice(0, 4000), Date.now()).run();
-  await env.DB.prepare(
-    'DELETE FROM history WHERE user_id = ? AND id NOT IN ' +
-    '(SELECT id FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?)'
-  ).bind(userId, userId, HISTORY_KEEP).run();
-}
-
-async function getHistory(env, userId) {
-  const rs = await env.DB.prepare(
-    'SELECT role, text FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?'
-  ).bind(userId, HISTORY_KEEP).all();
-  const rows = (rs && rs.results) || [];
-  return rows.reverse().map((r) => ({ role: r.role, content: r.text }));
-}
-
-// ---------------------------------------------------------------- LINE API
-
-async function callLine(pathname, token, body, method = 'POST') {
-  const res = await fetch('https://api.line.me' + pathname, {
-    method,
-    headers: {
-      'content-type': 'application/json',
-      Authorization: 'Bearer ' + token,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return res.status;
-}
-
-/** 推消息给用户（超长自动分段） */
-async function pushToLine(env, userId, text) {
-  const token = env.LINE_CHANNEL_TOKEN;
-  if (!token) return 0;
-  let last = 0;
-  const chunks = chunkText(text);
-  for (const c of chunks) {
-    last = await callLine('/v2/bot/message/push', token, {
-      to: userId,
-      messages: [{ type: 'text', text: c }],
-    });
-    if (last < 200 || last >= 300) return last;   // 单段失败就别往下发了
-  }
-  return last;
-}
-
-// ---------------------------------------------------------------- 云端 AI 兜底
-
-async function aiAnswer(env, userId, text) {
-  if (!env.AI) return null;
-  if (String(env.AI_FALLBACK || 'on').toLowerCase() === 'off') return null;
-  const history = await getHistory(env, userId);
-  const messages = [
-    { role: 'system', content: env.SYSTEM_PROMPT || DEFAULT_SYSTEM },
-    ...history,
-    { role: 'user', content: text },
-  ];
-  for (const model of AI_MODELS) {
-    try {
-      const out = await env.AI.run(model, { messages, max_tokens: 800 });
-      const reply = (out && (out.response || out.result || '') || '').trim();
-      if (reply) return reply;
-    } catch (e) {
-      console.error('[ai] 模型失败', model, String(e));
-    }
-  }
-  return null;
-}
-
-/** 云端代答一条：AI → 推回 → 记历史 → 出队 */
-async function answerInCloud(env, item, note) {
-  const text = (item.text || '').trim();
-  if (!text) { await dropFromQueue(env, item.id); return false; }
-  let reply = await aiAnswer(env, item.userId, text);
-  if (!reply) {
-    if (note) await pushToLine(env, item.userId, note);
-    return false;   // 没配 AI 就交回队列
-  }
-  const st = await pushToLine(env, item.userId, reply);
-  const ok = st >= 200 && st < 300;
-  if (ok) {
-    await pushHistory(env, item.userId, 'user', text);
-    await pushHistory(env, item.userId, 'assistant', reply);
-    await dropFromQueue(env, item.id);
-  }
-  return ok;
-}
-
-/**
- * 收回卡住的消息（挂在 /poll 主链路上 —— 不要用 ctx.waitUntil，实测不跑）。
- * 被取走超过 TAKE_STALE_MS 还没 ack 的：能云端答就云端答，否则退回 pending 等本机重投。
- */
-async function reviveStale(env) {
-  const now = Date.now();
-  const rs = await env.DB.prepare(
-    "SELECT id, user_id, text, kind, message_id, ts FROM inbox " +
-    "WHERE state = 'taken' AND taken_at < ? LIMIT 20"
-  ).bind(now - TAKE_STALE_MS).all();
-  const rows = (rs && rs.results) || [];
-  if (!rows.length) return 0;
-  let handled = 0;
-  for (const r of rows) {
-    const item = { id: r.id, userId: r.user_id, text: r.text, kind: r.kind, messageId: r.message_id };
-    if (await answerInCloud(env, item, null)) handled++;
-    else {
-      // 云端答不了 → 退回队列，让本机重投
-      await env.DB.prepare("UPDATE inbox SET state = 'pending', taken_at = NULL WHERE id = ?")
-        .bind(r.id).run();
-    }
-  }
-  return handled;
 }
 
 // ---------------------------------------------------------------- 入口
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const p = url.pathname;
 
-    // ---- 健康检查（公开，不含敏感信息）
+    // ---- 健康检查（公开，无害）
     if (request.method === 'GET' && p === '/') {
       return json({
-        ok: true,
-        service: 'line-agent-bridge',
+        status: '✅ 小姚 LINE 通道（中转版·D1）',
         online: await localOnline(env),
-        queue: await queueCount(env),
-        ai: !!env.AI,
         time: new Date().toISOString(),
       });
     }
 
-    // ---- LINE webhook（公开，必须验签）
-    if (p === '/webhook') {
+    // ---- LINE webhook：必须验签，公开
+    if (p === '/webhook' || p === '/line-webhook') {
       if (request.method === 'GET') return new Response('OK', { status: 200 });
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
       const raw = await request.text();
       const secret = env.LINE_CHANNEL_SECRET;
+      const sig = request.headers.get('x-line-signature');
       if (secret) {
-        const ok = await verifySignature(raw, request.headers.get('x-line-signature'), secret)
-          .catch(() => false);
+        const ok = await verifySignature(raw, sig, secret).catch(() => false);
         if (!ok) return new Response('Bad signature', { status: 403 });
       } else {
-        console.error('[webhook] LINE_CHANNEL_SECRET 未配置，本次跳过验签');
+        // 密钥丢失时放行并在日志里喊出来，避免整条 LINE 直接死掉
+        console.error('[line-worker] LINE_CHANNEL_SECRET 缺失，本次跳过验签');
       }
 
       let body;
       try { body = JSON.parse(raw); } catch { return new Response('OK', { status: 200 }); }
 
+      const token = env.LINE_CHANNEL_TOKEN;
       const online = await localOnline(env);
-      for (const ev of body.events || []) {
+      for (const event of body.events || []) {
         try {
-          const userId = (ev.source || {}).userId;
+          const src = event.source || {};
+          // 【2026-10-13】把每个事件原样记一行，用于诊断「拉进群后立刻退出」这类问题。
+          // 一次一行、字段截断，避免刷爆日志。
+          console.log('[line-worker] event ' + String(event.type) + ' src=' + JSON.stringify(src).slice(0, 200));
+          // 事件落库：诊断「拉进群后立刻退出」这类问题全靠它（join/leave 都会留下痕迹）
+          {
+            const evRow = env.DB.prepare(
+              'INSERT OR REPLACE INTO line_events (id, ts, type, srcType, srcId, userId, raw) VALUES (?, ?, ?, ?, ?, ?, ?)'
+            ).bind(
+              'e' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+              Date.now(), String(event.type || ''),
+              String(src.type || ''), String(src.groupId || src.roomId || ''),
+              String(src.userId || ''), JSON.stringify(event).slice(0, 900)
+            ).run().catch(() => {});
+            if (ctx && ctx.waitUntil) ctx.waitUntil(evRow);
+          }
+          const userId = src.userId;
           if (!userId) continue;
-          const perm = await isAllowed(env, userId);
 
-          if (!perm.allowed) {
-            await pushToLine(env, userId, '抱歉，这个机器人只服务已授权用户。');
-            continue;
-          }
-          if (perm.claimed) {
-            await pushToLine(env, userId,
-              '已把你设为本机器人的主人 ✅ 以后你的消息都收得到。');
+          // 来源判定：私聊 / 群组 / 多人房。群组消息以前会被当成私聊处理。
+          const replyToken = event.replyToken || '';
+          const srcType = src.type || 'user';
+          const srcId = srcType === 'group'
+            ? (src.groupId || '')
+            : srcType === 'room'
+              ? (src.roomId || '')
+              : userId;
+          if (srcType === 'group' || srcType === 'room') {
+            // 记下最近出现的群，方便本机自动发现并白名单
+            await setMeta(env, 'line:lastGroup', JSON.stringify({
+              type: srcType, id: srcId, from: userId, at: Date.now(),
+            })).catch(() => {});
           }
 
-          if (ev.type === 'message' && ev.message && ev.message.type === 'text') {
-            const text = (ev.message.text || '').trim();
+          if (event.type === 'message' && event.message && event.message.type === 'text') {
+            const text = (event.message.text || '').trim();
             if (!text) continue;
             const item = {
               id: 'm' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-              userId, text, kind: 'text', ts: Date.now(),
+              userId,
+              srcType,
+              srcId,
+              text,
+              replyToken,
+              ts: Date.now(),
+              state: 'pending',
             };
-            // 本机不在线 → 有 AI 就直接答，别让它干等
-            if (!online) {
-              const handled = await answerInCloud(env, item, '(本机未在线，这是云端 AI 的回复)');
-              if (handled) continue;
-              await pushToLine(env, userId, '本机当前未在线，消息已排进队列，稍后回复。');
-            }
             await enqueue(env, item);
-          } else if (ev.type === 'message' && ev.message && ev.message.type === 'audio') {
-            // 语音：本机没有 token 下载不了，只入队（带 messageId），本机取信后回头调 /audio
+            if (!online && token) await pushToLine(userId, QUEUED_NOTICE, token);
+          } else if (event.type === 'message' && event.message && event.message.type === 'audio') {
+            // 语音消息：本机没有 Channel Token，下载不了音频。
+            // 这里只入队（带 messageId），本机取信后回头调 /audio 由本 Worker 代取。
             const item = {
               id: 'm' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-              userId, kind: 'audio', messageId: ev.message.id || '', text: '', ts: Date.now(),
+              userId,
+              srcType,
+              srcId,
+              kind: 'audio',
+              replyToken,
+              messageId: event.message.id || '',
+              text: '',
+              ts: Date.now(),
+              state: 'pending',
             };
             await enqueue(env, item);
-            if (!online) await pushToLine(env, userId, '本机当前未在线，语音已排进队列。');
-          } else if (ev.type === 'follow') {
-            await pushToLine(env, userId, '你好！直接发消息就行，我会收到并回复。');
+            if (!online && token) await pushToLine(userId, QUEUED_NOTICE, token);
+          } else if (event.type === 'message' && event.message && event.message.type === 'image') {
+            // 【2026-10-14】圖片消息：与语音同构 —— 本机没有 Channel Token，
+            // 这里只入队（带 messageId），本机取信后回头调 /content 由本 Worker 代取图片。
+            const item = {
+              id: 'm' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+              userId,
+              srcType,
+              srcId,
+              kind: 'image',
+              replyToken,
+              messageId: event.message.id || '',
+              text: '',
+              ts: Date.now(),
+              state: 'pending',
+            };
+            await enqueue(env, item);
+            if (!online && token) await pushToLine(userId, QUEUED_NOTICE, token);
+          } else if (event.type === 'message' && event.message && event.message.type === 'file') {
+            // 【2026-10-14】檔案（PDF/文件…）：同圖片處理，本機取信後回頭代取。
+            const item = {
+              id: 'm' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+              userId,
+              srcType,
+              srcId,
+              kind: 'file',
+              replyToken,
+              messageId: event.message.id || '',
+              fileName: (event.message.fileName || ''),
+              text: '',
+              ts: Date.now(),
+              state: 'pending',
+            };
+            await enqueue(env, item);
+            if (!online && token) await pushToLine(userId, QUEUED_NOTICE, token);
+          } else if (event.type === 'join' && token) {
+            // 【2026-10-13】被拉进群/多人房时主动打招呼，并说明这个群的用途。
+            // 优先用 join 事件自带的 reply token（免费），失败才退回 push。
+            const greet =
+              '我是小姚 🐻 這個群我當成「記錄事情」的通道：\n' +
+              '你們說的話我會按時間記下來，要查、要整理、要提醒，直接在群裡說一聲就好。';
+            const rt = event.replyToken || '';
+            const where = srcId || userId;
+            let st = rt ? await replyToLine(rt, greet, token).catch(() => 0) : 0;
+            if (!(st >= 200 && st < 300)) st = await pushToLine(where, greet, token);
+            console.log('[line-worker] join 欢迎已发送 http=' + st + ' reftoken=' + !!rt);
+          } else if (event.type === 'follow' && token) {
+            await pushToLine(
+              userId,
+              '嗨！我是小姚 🐻 你的訊息我會收到。有話直接說，如果我沒馬上回，就是在忙，等一下就好。',
+              token
+            );
           }
         } catch (e) {
-          console.error('[webhook] 事件处理出错', String(e));
+          console.error('[line-worker] 处理事件出错:', String(e));
         }
       }
-      return new Response('OK', { status: 200 });   // 永远快速 200，别给 LINE 重试的理由
+      return new Response('OK', { status: 200 });   // 永远快速回 200，不给 LINE 重试的理由
     }
 
-    // ---- 以下接口只给本机守护用，必须带 key
-    const key = request.headers.get('x-bridge-key') || url.searchParams.get('k');
-    if (!env.BRIDGE_KEY || !timingSafeEqual(key, env.BRIDGE_KEY)) {
+    // ---- 以下接口只给本机小姚用，必须带 key
+    const key = request.headers.get('x-yao-key') || url.searchParams.get('k');
+    if (!env.YAO_KEY || !timingSafeEqual(String(key || ''), env.YAO_KEY)) {
       return json({ ok: false, error: 'unauthorized' }, 401);
     }
 
     if (request.method === 'GET' && p === '/ping') {
-      await setMeta(env, 'poll:last', Date.now());
+      await setMeta(env, 'poll:last', String(Date.now()));
       return json({ ok: true, ts: Date.now() });
     }
 
     if (request.method === 'GET' && p === '/poll') {
-      await setMeta(env, 'poll:last', Date.now());
-      await reviveStale(env);          // 挂在主链路上，别用 waitUntil
+      await setMeta(env, 'poll:last', String(Date.now()));
       const items = await poll(env);
-      return json({ ok: true, items, online: true });
+      return json({ ok: true, items });
     }
 
-    // 代取语音内容（token 不下发到本机）
-    if (request.method === 'GET' && p === '/audio') {
+    // 代取消息内容（语音 / 图片 / 文件通用）：由本 Worker 拿 Channel Token 去 LINE 取，
+    // token 不下发到本机。/audio 是旧名，保留兼容；/content 是通用名。
+    if (request.method === 'GET' && (p === '/audio' || p === '/content')) {
       const id = url.searchParams.get('id') || '';
       if (!id) return json({ ok: false, error: 'need id' }, 400);
       if (!env.LINE_CHANNEL_TOKEN) return json({ ok: false, error: 'no token' }, 500);
@@ -423,75 +377,162 @@ export default {
       });
     }
 
-    if (request.method === 'POST' && p === '/reply') {
-      const b = await request.json().catch(() => ({}));
-      if (!b.userId || !b.text) return json({ ok: false, error: 'userId and text required' }, 400);
-      const st = await pushToLine(env, b.userId, b.text);
-      if (b.id) await ack(env, [b.id]);
-      await pushHistory(env, b.userId, 'user', b.userText || '(本机 Agent 处理)');
-      await pushHistory(env, b.userId, 'assistant', b.text);
-      return json({ ok: st >= 200 && st < 300, httpStatus: st });
-    }
-
     if (request.method === 'POST' && p === '/ack') {
       const b = await request.json().catch(() => ({}));
       await ack(env, b.ids || []);
       return json({ ok: true });
     }
 
-    // 本机接不了 → 主动交棒给云端 AI（别让用户干等）
-    if (request.method === 'POST' && p === '/handoff') {
+    if (request.method === 'POST' && p === '/reply') {
       const b = await request.json().catch(() => ({}));
-      const id = b.id || url.searchParams.get('id');
-      if (!id) return json({ ok: false, error: 'need id' }, 400);
-      const row = await env.DB.prepare('SELECT * FROM inbox WHERE id = ?').bind(id).first();
-      if (!row) return json({ ok: false, error: 'not found' }, 404);
-      const item = {
-        id: row.id, userId: row.user_id, text: row.text, kind: row.kind, messageId: row.message_id,
-      };
-      const answered = await answerInCloud(env, item, '(本机忙，这是云端 AI 的回复)');
-      return json({ ok: true, answered: answered ? 1 : 0 });
-    }
+      // target 优先（群组回推）；老的本机版本只传 userId，保持兼容。
+      const target = String(b.target || b.userId || '');
+      if (!target || !b.text) return json({ ok: false, error: 'target and text required' }, 400);
 
-    // 手动收回所有卡住的消息
-    if (request.method === 'POST' && p === '/revive') {
-      const n = await reviveStale(env);
-      return json({ ok: true, handled: n });
-    }
+      // 【2026-10-13】靜默約定（Jack 規定：群裡只有被叫「小姚」才回應）。
+      // 本機判斷不該插話時，把回覆寫成 [靜默] → 這裡直接吞掉：不發送、不耗推播額度，但照樣 ack 讓訊息出佇列。
+      if (/^\s*\[(靜默|静默|SILENT|silent)\]\s*$/.test(String(b.text))) {
+        if (b.id) await ack(env, [b.id]);
+        return json({ ok: true, silent: true });
+      }
 
-    if (request.method === 'GET' && p === '/status') {
-      const oid = await ownerId(env);
+      let viaReply = null;
+      let st = 0;
+      if (b.replyToken) {
+        // reply token 免费不占额度；过期/用掉会返回非 2xx，退回 push
+        viaReply = await replyToLine(b.replyToken, b.text, env.LINE_CHANNEL_TOKEN).catch(() => 0);
+        if (viaReply >= 200 && viaReply < 300) st = viaReply;
+      }
+      if (st < 200 || st >= 300) {
+        // 【2026-10-15】Jack 規則：「LINE 如果來不及回應，可以等下次有叫你時一起回應。」
+        // 回得太慢 → reply token 已過期 → 以前會退回 push（群組一次就扣 5 則）。
+        // 帶 hold:true 時不 push，直接把「送出失敗」回報本機，由本機把回覆掛著，
+        // 等他下次叫我（會有新的免費 reply token）再一起送出。訊息照樣 ack 出佇列，不重複處理。
+        if (b.hold) {
+          if (b.id) await ack(env, [b.id]);
+          return json({ ok: false, held: true, httpStatus: st, viaReplyToken: false });
+        }
+        st = await pushToLine(target, b.text, env.LINE_CHANNEL_TOKEN);
+      }
+      let fallback = null;
+      if ((st < 200 || st >= 300) && b.fallbackUserId && String(b.fallbackUserId) !== target) {
+        // 群推失败（额度用尽 / 已被移出群 / room 不支持 push）→ 回退私聊，绝不静默丢
+        const st2 = await pushToLine(
+          b.fallbackUserId,
+          '【群組回覆沒送出去｜HTTP ' + st + '】' + b.text,
+          env.LINE_CHANNEL_TOKEN
+        );
+        fallback = st2;
+      }
+      if (b.id) await ack(env, [b.id]);
       return json({
-        ok: true,
-        online: await localOnline(env),
-        lastPoll: await lastPollIso(env),
-        queue: await queueCount(env),
-        owner: oid ? '已设置' : '未认领（发一条消息即可认领）',
-        ownerId: oid || null,      // 本机可读（已用 key 鉴权），用来主动推消息
-        ai: !!env.AI,
-        hasSecret: !!env.LINE_CHANNEL_SECRET,
-        hasToken: !!env.LINE_CHANNEL_TOKEN,
+        ok: st >= 200 && st < 300,
+        httpStatus: st,
+        viaReplyToken: !!viaReply,
+        fallbackHttpStatus: fallback,
       });
     }
 
-    // 主动推一条测试消息
+    if (request.method === 'GET' && p === '/quota') {
+      // 免费方案的推播额度是本通道的隐形天花板，主动暴露出来，别等它悄悄断掉
+      const out = { ok: true };
+      try {
+        const r1 = await fetch(LINE_API + '/message/quota', {
+          headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN },
+        });
+        out.quota = await r1.json().catch(() => null);
+        const r2 = await fetch(LINE_API + '/message/quota/consumption', {
+          headers: { Authorization: 'Bearer ' + env.LINE_CHANNEL_TOKEN },
+        });
+        out.consumption = await r2.json().catch(() => null);
+      } catch (e) {
+        out.ok = false;
+        out.error = String(e);
+      }
+      return json(out);
+    }
+
+    if (request.method === 'GET' && p === '/events') {
+      const n = Math.min(parseInt(url.searchParams.get('n') || '20', 10) || 20, 100);
+      const rs = await env.DB.prepare(
+        'SELECT ts, type, srcType, srcId, userId, raw FROM line_events ORDER BY ts DESC LIMIT ?'
+      ).bind(n).all();
+      return json({ ok: true, events: (rs && rs.results) || [] });
+    }
+
+    // 【2026-10-13】查群組成員與顯示名稱（診斷「群裡有誰」用）
+    //   GET /members?groupId=Cxxxx  → 列出成員 id 與 displayName
+    //   GET /members?userId=Uxxxx  → 查單一使用者資料
+    if (request.method === 'GET' && p === '/members') {
+      const gid = url.searchParams.get('groupId');
+      const uid = url.searchParams.get('userId');
+      const tk = env.LINE_CHANNEL_TOKEN;
+      const out = { ok: true };
+      try {
+        if (gid) {
+          const r1 = await fetch(
+            LINE_API + '/group/' + encodeURIComponent(gid) + '/members/ids',
+            { headers: { Authorization: 'Bearer ' + tk } }
+          );
+          const raw1 = await r1.text();
+          out.status1 = r1.status;
+          out.raw1 = raw1.slice(0, 300);
+          let j1 = {};
+          try { j1 = JSON.parse(raw1); } catch (_) {}
+          const ids = j1.memberIds || [];
+          out.groupId = gid;
+          out.count = ids.length;
+          out.members = [];
+          for (const id of ids) {
+            let nm = null;
+            try {
+              const r2 = await fetch(
+                LINE_API + '/group/' + encodeURIComponent(gid) + '/member/' + encodeURIComponent(id),
+                { headers: { Authorization: 'Bearer ' + tk } }
+              );
+              const j2 = await r2.json();
+              nm = j2.displayName || null;
+            } catch (_) {}
+            out.members.push({ userId: id, displayName: nm });
+          }
+        } else if (uid) {
+          const r2 = await fetch(LINE_API + '/profile/' + encodeURIComponent(uid), {
+            headers: { Authorization: 'Bearer ' + tk },
+          });
+          out.profile = await r2.json();
+        } else {
+          return json({ ok: false, error: 'need ?groupId= or ?userId=' }, 400);
+        }
+      } catch (e) {
+        out.ok = false;
+        out.error = String(e);
+      }
+      return json(out);
+    }
+
+    if (request.method === 'GET' && p === '/status') {
+      const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM line_inbox').first();
+      const last = parseInt(await getMeta(env, 'poll:last'), 10);
+      const lastGroup = await getMeta(env, 'line:lastGroup').catch(() => null);
+      return json({
+        ok: true,
+        online: await localOnline(env),
+        lastPoll: Number.isFinite(last) ? new Date(last).toISOString() : null,
+        queue: c ? Number(c.n) : 0,
+        hasSecret: !!env.LINE_CHANNEL_SECRET,
+        hasToken: !!env.LINE_CHANNEL_TOKEN,
+        lastGroup: lastGroup ? JSON.parse(lastGroup) : null,
+      });
+    }
+
+    // 主动推一条测试消息给你
     if (request.method === 'GET' && p === '/debug-ping') {
-      const uid = url.searchParams.get('u') || (await ownerId(env));
+      const uid = url.searchParams.get('u');
       if (!uid) return json({ ok: false, error: 'need ?u=<LINE userId>' }, 400);
-      const st = await pushToLine(env, uid, '【通道实测】这条是云端主动推的，收到说明推送链路正常。');
+      const st = await pushToLine(uid, '【小姚・通道实测】这条是 Worker 主动推的。', env.LINE_CHANNEL_TOKEN);
       return json({ ok: st < 300, httpStatus: st });
     }
 
-    return json({ ok: false, error: 'not found' }, 404);
+    return new Response('Not found', { status: 404 });
   },
 };
-
-async function queueCount(env) {
-  const c = await env.DB.prepare('SELECT COUNT(*) AS n FROM inbox').first();
-  return c ? Number(c.n) : 0;
-}
-
-async function lastPollIso(env) {
-  const last = parseInt(await getMeta(env, 'poll:last'), 10);
-  return Number.isFinite(last) ? new Date(last).toISOString() : null;
-}
